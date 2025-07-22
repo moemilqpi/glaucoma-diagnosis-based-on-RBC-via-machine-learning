@@ -1,0 +1,243 @@
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression, RidgeClassifier, SGDClassifier, LogisticRegressionCV
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+from sklearn.neighbors import KNeighborsClassifier
+from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, roc_auc_score,
+    log_loss, brier_score_loss, f1_score, fbeta_score,
+    mean_squared_error
+)
+from copy import deepcopy
+
+def percentile_confidence_interval(data, ci=95):
+    """
+    直接计算基于数据分布的置信区间（非 Bootstrap）
+    """
+    lower = np.percentile(data, (100 - ci) / 2)
+    upper = np.percentile(data, 100 - (100 - ci) / 2)
+    return np.mean(data), (lower, upper)
+
+def compute_ci_table(df, metrics, method='bootstrap'):
+    """
+    计算每个模型的每个指标的置信区间
+    method: 'bootstrap' 或 'percentile'
+    """
+    ci_results = {}
+    for model_name, group in df.groupby("Model"):
+        ci_results[model_name] = {}
+        for metric in metrics:
+            values = group[metric].values
+            if method == 'bootstrap':
+                mean, (low, high) = bootstrap_confidence_interval(values)
+            elif method == 'percentile':
+                mean, (low, high) = percentile_confidence_interval(values)
+            else:
+                raise ValueError("method must be 'bootstrap' or 'percentile'")
+            ci_results[model_name][metric] = f"{mean:.4f} ({low:.4f}, {high:.4f})"
+    return pd.DataFrame(ci_results).T
+
+
+def bootstrap_confidence_interval(data, n_bootstrap=1000, ci=95):
+    boot_means = []
+    n = len(data)
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(data, size=n, replace=True)
+        boot_means.append(np.mean(sample))
+    lower = np.percentile(boot_means, (100 - ci) / 2)
+    upper = np.percentile(boot_means, 100 - (100 - ci) / 2)
+    return np.mean(data), (lower, upper)
+
+# def compute_ci_table(df, metrics):
+#     ci_results = {}
+#     for model_name, group in df.groupby("Model"):
+#         ci_results[model_name] = {}
+#         for metric in metrics:
+#             mean, (low, high) = bootstrap_confidence_interval(group[metric].values)
+#             ci_results[model_name][metric] = f"{mean:.4f} ({low:.4f}, {high:.4f})"
+#     return pd.DataFrame(ci_results).T
+
+# 读取数据
+patients_data = pd.read_excel('E:\Code\matlabCode\省医院\代码汇总\ImageForSeg\Patient\PatientData_xinzeng.xlsx', sheet_name='0.7%')
+healthy_data = pd.read_excel('E:\Code\matlabCode\省医院\代码汇总\ImageForSeg\Healthy\HealthyData_xinzeng3.xlsx', sheet_name='0.7%')
+features = ['Skewness']
+
+models = {
+    "Lasso": LogisticRegressionCV(cv=5, penalty='l1', solver='liblinear'),
+    "Logistic Regression": LogisticRegression(penalty='l2'),
+    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+    "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=100, random_state=42),
+    "Ridge Classifier": RidgeClassifier(tol=0.001),
+    "SVC": SVC(kernel='linear', probability=True, random_state=42),
+    "SGD Classifier": SGDClassifier(loss='hinge', alpha=0.0001,max_iter=1000, tol=1e-3, random_state=42),
+    "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=5),
+    "AdaBoost": AdaBoostClassifier(n_estimators=50, random_state=42),
+    "Gaussian NB": GaussianNB(),
+    "QDA": QuadraticDiscriminantAnalysis(),
+}
+
+metrics = [
+    "F1 Score", "F2 Score", "F0.5 Score", "NPV", "Precision", "Recall",
+    "Accuracy", "Specificity", "AUC", "Log Loss", "Brier Score"
+]
+
+train_results, test_results = [], []
+
+for seed in range(500):
+    train_patients = patients_data.sample(n=17, random_state=seed)
+    test_patients = patients_data.drop(train_patients.index)
+    train_healthy = healthy_data.sample(n=17, random_state=seed + 1000)
+    test_healthy = healthy_data.drop(train_healthy.index)
+
+    train_set = pd.concat([train_patients, train_healthy])
+    test_set = pd.concat([test_patients, test_healthy])
+
+    X_train_all = train_set[features].reset_index(drop=True)
+    y_train_all = train_set['Healthy'].reset_index(drop=True)
+    X_test = test_set[features].reset_index(drop=True)
+    y_test = test_set['Healthy'].reset_index(drop=True)
+
+    for model_name, model in models.items():
+        kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+        fold_metrics = []
+
+        # 每一折性能记录
+        fold_f1s, fold_f2s, fold_f0_5s = [], [], []
+        fold_aucs, fold_log_losses, fold_briers = [], [], []
+        fold_precisions, fold_recalls, fold_specificities, fold_npvs = [], [], [], []
+        fold_accuracies = []
+
+        for train_idx, val_idx in kf.split(X_train_all):
+            X_train_fold = X_train_all.loc[train_idx]
+            y_train_fold = y_train_all.loc[train_idx]
+            X_val_fold = X_train_all.loc[val_idx]
+            y_val_fold = y_train_all.loc[val_idx]
+            # 如果 y_val_fold 或 y_test 只包含一个类，则跳过这一折的评估
+            if len(np.unique(y_val_fold)) < 2:
+                continue
+
+            scaler_fold = StandardScaler()
+            X_train_scaled = scaler_fold.fit_transform(X_train_fold)
+            X_val_scaled = scaler_fold.transform(X_val_fold)
+
+            # global_mean = X_train_fold.values.mean()
+            # X_train_scaled = X_train_fold / global_mean
+            # X_val_scaled = X_val_fold / global_mean
+
+            clf = deepcopy(model)
+            clf.fit(X_train_scaled, y_train_fold)
+
+            if hasattr(clf, "predict_proba"):
+                y_val_prob = clf.predict_proba(X_val_scaled)[:, 1]
+            else:
+                score = clf.decision_function(X_val_scaled)
+                y_val_prob = 1 / (1 + np.exp(-score))
+            y_val_pred = (y_val_prob > 0.5).astype(int)
+
+            cm = confusion_matrix(y_val_fold, y_val_pred)
+            TP, TN = cm[1,1], cm[0,0]
+            FP, FN = cm[0,1], cm[1,0]
+
+            fold_f1s.append(f1_score(y_val_fold, y_val_pred))
+            fold_f2s.append(fbeta_score(y_val_fold, y_val_pred, beta=2))
+            fold_f0_5s.append(fbeta_score(y_val_fold, y_val_pred, beta=0.5))
+            fold_aucs.append(roc_auc_score(y_val_fold, y_val_prob))
+            fold_log_losses.append(log_loss(y_val_fold, y_val_prob))
+            fold_briers.append(brier_score_loss(y_val_fold, y_val_prob))
+            fold_precisions.append(TP / (TP + FP) if (TP + FP) else 0)
+            fold_recalls.append(TP / (TP + FN) if (TP + FN) else 0)
+            fold_specificities.append(TN / (TN + FP) if (TN + FP) else 0)
+            fold_npvs.append(TN / (TN + FN) if (TN + FN) else 0)
+            fold_accuracies.append(accuracy_score(y_val_fold, y_val_pred))
+
+            mse = mean_squared_error(y_val_fold, y_val_prob)
+            fold_metrics.append((mse, deepcopy(clf), deepcopy(scaler_fold)))
+            #fold_metrics.append((mse, deepcopy(clf), global_mean))
+
+        train_results.append({
+            "Model": model_name,
+            "F1 Score": np.mean(fold_f1s),
+            "F2 Score": np.mean(fold_f2s),
+            "F0.5 Score": np.mean(fold_f0_5s),
+            "NPV": np.mean(fold_npvs),
+            "Precision": np.mean(fold_precisions),
+            "Recall": np.mean(fold_recalls),
+            "Accuracy": np.mean(fold_accuracies),
+            "Specificity": np.mean(fold_specificities),
+            "AUC": np.mean(fold_aucs),
+            "Log Loss": np.mean(fold_log_losses),
+            "Brier Score": np.mean(fold_briers),
+        })
+
+        # 使用最小 MSE 对应模型评估测试集
+        best_model_tuple = min(fold_metrics, key=lambda x: x[0])
+        best_model, best_scaler = best_model_tuple[1], best_model_tuple[2]
+
+        X_test_scaled = best_scaler.transform(X_test)
+
+        # best_model, best_global_mean = best_model_tuple[1], best_model_tuple[2]
+        #
+        # # 测试集归一化也使用训练集全局均值
+        # X_test_scaled = X_test / best_global_mean
+        if hasattr(best_model, "predict_proba"):
+            y_test_prob = best_model.predict_proba(X_test_scaled)[:, 1]
+        else:
+            score = best_model.decision_function(X_test_scaled)
+            y_test_prob = 1 / (1 + np.exp(-score))
+        y_test_pred = (y_test_prob > 0.5).astype(int)
+
+        cm = confusion_matrix(y_test, y_test_pred)
+        TP, TN = cm[1,1], cm[0,0]
+        FP, FN = cm[0,1], cm[1,0]
+
+        test_results.append({
+            "Model": model_name,
+            "F1 Score": f1_score(y_test, y_test_pred),
+            "F2 Score": fbeta_score(y_test, y_test_pred, beta=2),
+            "F0.5 Score": fbeta_score(y_test, y_test_pred, beta=0.5),
+            "NPV": TN / (TN + FN) if (TN + FN) else 0,
+            "Precision": TP / (TP + FP) if (TP + FP) else 0,
+            "Recall": TP / (TP + FN) if (TP + FN) else 0,
+            "Accuracy": accuracy_score(y_test, y_test_pred),
+            "Specificity": TN / (TN + FP) if (TN + FP) else 0,
+            "AUC": roc_auc_score(y_test, y_test_prob),
+            "Log Loss": log_loss(y_test, y_test_prob),
+            "Brier Score": brier_score_loss(y_test, y_test_prob),
+        })
+
+# 输出汇总
+train_df = pd.DataFrame(train_results)
+test_df = pd.DataFrame(test_results)
+auc_range = (
+    test_df.groupby("Model")["AUC"]
+           .agg(['min', 'max'])
+           .rename(columns={'min': 'AUC_min', 'max': 'AUC_max'})
+)
+
+print("\n测试集 AUC 最大/最小值：")
+print(auc_range)
+train_summary = train_df.groupby("Model").agg(['mean', 'std'])
+test_summary = test_df.groupby("Model").agg(['mean', 'std'])
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
+pd.set_option('display.float_format', '{:.4f}'.format)
+
+print("\n训练集表现：")
+print(train_summary)
+print("\n测试集表现：")
+print(test_summary)
+
+print("\n训练集各指标95%置信区间（bootstrap）：")
+train_ci_df = compute_ci_table(train_df, metrics, method='bootstrap')
+print(train_ci_df)
+
+print("\n测试集各指标95%置信区间（percentile from 100 runs）：")
+test_ci_df = compute_ci_table(test_df, metrics, method='percentile')
+print(test_ci_df)
